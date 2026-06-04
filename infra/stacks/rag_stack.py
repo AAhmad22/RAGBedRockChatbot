@@ -20,9 +20,17 @@ from aws_cdk import (
     Duration,
     RemovalPolicy,
     Stack,
+)
+from aws_cdk import (
     aws_apigateway as apigw,
+)
+from aws_cdk import (
     aws_iam as iam,
+)
+from aws_cdk import (
     aws_lambda as lambda_,
+)
+from aws_cdk import (
     aws_s3 as s3,
 )
 from cdklabs.generative_ai_cdk_constructs import bedrock
