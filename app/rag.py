@@ -100,9 +100,7 @@ def _build_context(chunks: list[RetrievedChunk]) -> str:
 
 def generate(question: str, chunks: list[RetrievedChunk]) -> str:
     """Generate a grounded answer from the retrieved context."""
-    user_message = (
-        f"Context:\n{_build_context(chunks)}\n\nQuestion: {question}"
-    )
+    user_message = f"Context:\n{_build_context(chunks)}\n\nQuestion: {question}"
     response = _runtime_client().converse(
         modelId=settings.generation_model_id,
         system=[{"text": SYSTEM_PROMPT}],
