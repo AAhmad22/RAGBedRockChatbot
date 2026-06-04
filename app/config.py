@@ -9,6 +9,8 @@ from dataclasses import dataclass
 @dataclass(frozen=True)
 class Settings:
     knowledge_base_id: str = os.getenv("KNOWLEDGE_BASE_ID", "")
+    data_source_id: str = os.getenv("DATA_SOURCE_ID", "")
+    docs_bucket: str = os.getenv("DOCS_BUCKET", "")
     generation_model_id: str = os.getenv(
         "GENERATION_MODEL_ID", "anthropic.claude-3-5-sonnet-20240620-v1:0"
     )
