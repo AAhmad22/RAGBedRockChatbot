@@ -1,42 +1,31 @@
 """CDK stack for the RAGBedRockChatbot.
 
-This is a *stub* that lays out the resources and their relationships. The
-sections marked TODO are the parts that need real configuration before
-`cdk deploy` will produce a working system (notably: the OpenSearch
-Serverless vector index mapping, and the Bedrock embedding/foundation
-model ARNs for your region).
+Provisions, using the AWS Generative AI CDK Constructs (awslabs):
+  - an S3 bucket for source documents
+  - a Bedrock Knowledge Base backed by an auto-provisioned OpenSearch
+    Serverless vector collection + index (the construct also wires the
+    encryption / network / data-access policies and the KB service role)
+  - an S3 data source for the Knowledge Base
+  - a Lambda (FastAPI via Mangum) behind API Gateway to serve /chat
 
-NOTE: Bedrock Knowledge Bases involve several fiddly L1 (Cfn*) constructs.
-If you'd rather not wire them by hand, the community library
-`@cdklabs/generative-ai-cdk-constructs` provides higher-level constructs
-for Bedrock Knowledge Bases + OpenSearch Serverless. This stub uses L1
-constructs to keep dependencies minimal and the moving parts visible.
+Writing and synthesising this is free. ``cdk deploy`` creates real resources
+and starts billing - notably the OpenSearch Serverless collection, which bills
+hourly even when idle, so tear the stack down when you are done.
 """
 
 from __future__ import annotations
 
 from aws_cdk import (
+    CfnOutput,
+    Duration,
     RemovalPolicy,
     Stack,
-)
-from aws_cdk import (
     aws_apigateway as apigw,
-)
-from aws_cdk import (
-    aws_bedrock as bedrock,
-)
-from aws_cdk import (
     aws_iam as iam,
-)
-from aws_cdk import (
     aws_lambda as lambda_,
-)
-from aws_cdk import (
-    aws_opensearchserverless as aoss,
-)
-from aws_cdk import (
     aws_s3 as s3,
 )
+from cdklabs.generative_ai_cdk_constructs import bedrock
 from constructs import Construct
 
 
@@ -44,108 +33,71 @@ class RagStack(Stack):
     def __init__(self, scope: Construct, construct_id: str, **kwargs: object) -> None:
         super().__init__(scope, construct_id, **kwargs)
 
-        # --- 1. Source document bucket -------------------------------------
+        # --- Source documents -------------------------------------------
         docs_bucket = s3.Bucket(
             self,
             "DocsBucket",
             block_public_access=s3.BlockPublicAccess.BLOCK_ALL,
             encryption=s3.BucketEncryption.S3_MANAGED,
-            removal_policy=RemovalPolicy.DESTROY,  # portfolio project: easy teardown
+            removal_policy=RemovalPolicy.DESTROY,  # easy teardown for a demo
             auto_delete_objects=True,
         )
 
-        # --- 2. OpenSearch Serverless vector collection --------------------
-        # TODO: add the encryption / network / data-access policies that
-        # OpenSearch Serverless requires, and create the vector index with
-        # the correct dimension for your embedding model (e.g. 1024 for
-        # Titan Text Embeddings v2).
-        vector_collection = aoss.CfnCollection(
-            self,
-            "VectorCollection",
-            name="ragbedrock-vectors",
-            type="VECTORSEARCH",
-        )
-
-        # --- 3. IAM role assumed by the Bedrock Knowledge Base -------------
-        kb_role = iam.Role(
-            self,
-            "KnowledgeBaseRole",
-            assumed_by=iam.ServicePrincipal("bedrock.amazonaws.com"),
-        )
-        docs_bucket.grant_read(kb_role)
-        # TODO: grant aoss:APIAccessAll on the collection + bedrock invoke on
-        # the embedding model to kb_role.
-
-        # --- 4. Bedrock Knowledge Base + S3 data source --------------------
-        # TODO: set EMBEDDING_MODEL_ARN for your region, and fill in the
-        # OpenSearch Serverless field mapping (vector / text / metadata).
-        embedding_model_arn = (
-            f"arn:aws:bedrock:{self.region}::foundation-model/"
-            "amazon.titan-embed-text-v2:0"
-        )
-        knowledge_base = bedrock.CfnKnowledgeBase(
+        # --- Knowledge Base + OpenSearch Serverless ---------------------
+        # VectorKnowledgeBase auto-provisions the OpenSearch Serverless
+        # collection, the vector index, the access/encryption/network
+        # policies, and the KB service role - the parts that are very
+        # error-prone to hand-wire with raw L1 constructs.
+        knowledge_base = bedrock.VectorKnowledgeBase(
             self,
             "KnowledgeBase",
-            name="ragbedrock-kb",
-            role_arn=kb_role.role_arn,
-            knowledge_base_configuration=bedrock.CfnKnowledgeBase.KnowledgeBaseConfigurationProperty(
-                type="VECTOR",
-                vector_knowledge_base_configuration=bedrock.CfnKnowledgeBase.VectorKnowledgeBaseConfigurationProperty(
-                    embedding_model_arn=embedding_model_arn,
-                ),
-            ),
-            storage_configuration=bedrock.CfnKnowledgeBase.StorageConfigurationProperty(
-                type="OPENSEARCH_SERVERLESS",
-                opensearch_serverless_configuration=bedrock.CfnKnowledgeBase.OpenSearchServerlessConfigurationProperty(
-                    collection_arn=vector_collection.attr_arn,
-                    vector_index_name="ragbedrock-index",
-                    field_mapping=bedrock.CfnKnowledgeBase.OpenSearchServerlessFieldMappingProperty(
-                        vector_field="vector",  # TODO: match your index
-                        text_field="text",
-                        metadata_field="metadata",
-                    ),
-                ),
+            embeddings_model=bedrock.BedrockFoundationModel.TITAN_EMBED_TEXT_V2_1024,
+            instruction=(
+                "Answer using only the indexed documents. If the documents do "
+                "not contain the answer, say you do not have enough information."
             ),
         )
 
-        bedrock.CfnDataSource(
+        data_source = bedrock.S3DataSource(
             self,
-            "S3DataSource",
-            name="ragbedrock-s3-source",
-            knowledge_base_id=knowledge_base.attr_knowledge_base_id,
-            data_source_configuration=bedrock.CfnDataSource.DataSourceConfigurationProperty(
-                type="S3",
-                s3_configuration=bedrock.CfnDataSource.S3DataSourceConfigurationProperty(
-                    bucket_arn=docs_bucket.bucket_arn,
-                ),
-            ),
+            "DataSource",
+            bucket=docs_bucket,
+            knowledge_base=knowledge_base,
+            data_source_name="documents",
+            chunking_strategy=bedrock.ChunkingStrategy.FIXED_SIZE,
         )
 
-        # --- 5. Lambda handler (FastAPI app) -------------------------------
-        # TODO: package app/ with its dependencies (e.g. via a Docker image
-        # or a Lambda layer) before this will deploy a working function.
+        # --- Serving layer: FastAPI on Lambda behind API Gateway --------
+        # NOTE: this asset ships only the app source. Before the function
+        # will actually run, its dependencies (fastapi, mangum, pydantic)
+        # must be bundled in - via a Lambda layer or a container image. The
+        # KB data layer above deploys and works without this; for a quick
+        # demo you can run the FastAPI app locally against the deployed KB.
         handler = lambda_.Function(
             self,
             "ChatHandler",
             runtime=lambda_.Runtime.PYTHON_3_11,
             handler="main.handler",
-            code=lambda_.Code.from_asset("../app"),  # TODO: bundle deps
-            environment={
-                "KNOWLEDGE_BASE_ID": knowledge_base.attr_knowledge_base_id,
-                # TODO: GENERATION_MODEL_ID, etc.
-            },
+            code=lambda_.Code.from_asset("../app"),
+            timeout=Duration.seconds(30),
+            memory_size=512,
+            environment={"KNOWLEDGE_BASE_ID": knowledge_base.knowledge_base_id},
         )
         handler.add_to_role_policy(
             iam.PolicyStatement(
-                actions=["bedrock:RetrieveAndGenerate", "bedrock:Retrieve"],
-                resources=["*"],  # TODO: scope to the KB ARN
+                actions=[
+                    "bedrock:Retrieve",
+                    "bedrock:RetrieveAndGenerate",
+                    "bedrock:InvokeModel",
+                ],
+                resources=["*"],  # TODO: scope to the KB and model ARNs
             )
         )
 
-        # --- 6. API Gateway in front of the Lambda -------------------------
-        apigw.LambdaRestApi(
-            self,
-            "ChatApi",
-            handler=handler,
-            proxy=True,
-        )
+        api = apigw.LambdaRestApi(self, "ChatApi", handler=handler, proxy=True)
+
+        # --- Outputs (consumed by ingestion + the frontend) ------------
+        CfnOutput(self, "DocsBucketName", value=docs_bucket.bucket_name)
+        CfnOutput(self, "KnowledgeBaseId", value=knowledge_base.knowledge_base_id)
+        CfnOutput(self, "DataSourceId", value=data_source.data_source_id)
+        CfnOutput(self, "ChatApiUrl", value=api.url)
