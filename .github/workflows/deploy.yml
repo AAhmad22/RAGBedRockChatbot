@@ -9,8 +9,6 @@ name: Deploy
 #   3. Store its ARN as the repo variable AWS_DEPLOY_ROLE_ARN
 
 on:
-  push:
-    branches: [main]
   workflow_dispatch: {}
 
 permissions:
